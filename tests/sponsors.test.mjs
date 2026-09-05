@@ -1,0 +1,55 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
+import ts from 'typescript';
+import {createHash} from 'node:crypto';
+const sqlite=new DatabaseSync(':memory:');
+for(const file of fs.readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())sqlite.exec(fs.readFileSync(`drizzle/${file}`,'utf8'));
+const objects=new Map();
+const DB={prepare(sql){const statement=sqlite.prepare(sql);let values=[];return {bind(...args){values=args;return this},async first(){return statement.get(...values)||null},async all(){return {results:statement.all(...values)}},async run(){statement.run(...values);return {success:true}}}},async batch(items){const result=[];for(const s of items)result.push(await s.run());return result}};
+const BUCKET={async put(key,bytes,options){objects.set(key,{bytes:Buffer.from(bytes),options})},async get(key){const item=objects.get(key);return item?{body:item.bytes,httpEtag:'test',writeHttpMetadata(headers){headers.set('content-type',item.options.httpMetadata.contentType)}}:null}};
+globalThis.__sponsorTestEnv={DB,BUCKET};
+const modules=new Map();
+async function load(file){file=path.resolve(file);if(modules.has(file))return modules.get(file);let source=fs.readFileSync(file,'utf8');const imports=[...source.matchAll(/import\s+([^;]+?)\s+from\s+["']([^"']+)["'];?/g)];for(const match of imports){const [line,specifier,target]=match;if(target==='cloudflare:workers')source=source.replace(line,'const env=globalThis.__sponsorTestEnv;');else if(target.startsWith('.')){const imported=path.resolve(path.dirname(file),target+(path.extname(target)?'':'.ts'));source=source.replace(line,`import ${specifier} from ${JSON.stringify(await load(imported))};`)}else if(target==='vinext/server/app-router-entry')source=source.replace(line,'const handler={fetch:async()=>new Response("untouched route")};');else if(target==='vinext/server/image-optimization')source=source.replace(line,'const handleImageOptimization=()=>{},DEFAULT_DEVICE_SIZES=[],DEFAULT_IMAGE_SIZES=[];');else throw new Error(`Unexpected import: ${target}`)}const js=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}}).outputText;const url='data:text/javascript;base64,'+Buffer.from(js).toString('base64');modules.set(file,url);return url}
+const worker=(await import(await load('worker/index.ts'))).default;
+const uploads=await import(await load('app/api/uploads/route.ts'));
+const crud=await import(await load('app/api/admin/sponsors/route.ts'));
+const publicApi=await import(await load('app/api/sponsors/route.ts'));
+const validation=await import(await load('app/sponsor-upload.ts'));
+const token='local-test-session';const hashed=createHash('sha256').update(token).digest('hex');
+await DB.prepare("INSERT INTO admin_sessions(token_hash,email,role,expires_at) VALUES(?,?,'OWNER',?)").bind(hashed,'test@example.test',Date.now()+3600000).run();
+const cookie=`dl_admin=${token}`;
+const fixtures=process.env.SPONSOR_FIXTURES;
+assert.ok(fixtures,'Set SPONSOR_FIXTURES to a directory containing real image fixtures.');
+async function upload(name,type,auth=true,override){const data=override||fs.readFileSync(path.join(fixtures,name)),form=new FormData();form.set('file',new File([data],name,{type}));form.set('kind','sponsor');const request=new Request('https://league.test/api/uploads?kind=sponsor',{method:'POST',headers:{origin:'https://league.test',...(auth?{cookie}:{})},body:form});const serialized=await request.arrayBuffer();const headers=new Headers(request.headers);headers.set("content-length",String(serialized.byteLength));return worker.fetch(new Request(request.url,{method:"POST",headers,body:serialized}),{},{});}
+let logo;
+for(const [name,type] of [['small.png','image/png'],['large.png','image/png'],['photo.jpg','image/jpeg'],['photo.jpeg','image/jpeg'],['logo.webp','image/webp']]){
+ const bytes=fs.readFileSync(path.join(fixtures,name));if(name==='large.png')assert.ok(bytes.length>2*1024*1024&&bytes.length<4*1024*1024);
+ const r=await upload(name,type);assert.equal(r.status,201,`${name}: ${await r.clone().text()}`);const j=await r.json();logo=j.url;
+ const read=await uploads.GET(new Request('https://league.test'+j.url));assert.equal(read.status,200);assert.equal(read.headers.get('content-type'),type);assert.deepEqual(Buffer.from(await read.arrayBuffer()),bytes);console.log(`PASS upload/read identical bytes: ${name} (${bytes.length} bytes)`);
+}
+assert.equal((await upload('oversized.png','image/png')).status,413);
+const exact=Buffer.alloc(validation.SPONSOR_MAX_BYTES);fs.readFileSync(path.join(fixtures,'small.png')).copy(exact);
+assert.equal((await upload('exact.png','image/png',true,exact)).status,201);
+assert.equal((await upload('over.png','image/png',true,Buffer.concat([exact,Buffer.alloc(1)]))).status,413);
+assert.equal((await upload('small.png','image/png',false)).status,401);
+assert.equal((await upload('wrong.txt','image/png',true,fs.readFileSync(path.join(fixtures,'small.png')))).status,415);
+assert.equal((await upload('fake.png','image/png',true,Buffer.from('not an image'))).status,415);
+assert.equal((await upload('small.png','image/jpeg')).status,415);
+const body={name:'Parceiro teste',description:'Descrição oficial',instagram_url:'@marca',logo_url:logo};
+const req=(method,body,auth=true)=>new Request('https://league.test/api/admin/sponsors',{method,headers:{'content-type':'application/json',origin:'https://league.test',...(auth?{cookie}:{})},body:JSON.stringify(body)});
+assert.equal((await crud.POST(req('POST',body,false))).status,401);
+assert.equal((await crud.POST(req('POST',{...body,description:' '}))).status,400);
+const created=await crud.POST(req('POST',body));assert.equal(created.status,200);const {id}=await created.json();
+let listing=await (await publicApi.GET()).json();assert.equal(listing.sponsors.length,1);assert.equal(listing.sponsors[0].logo_url,logo);assert.equal(listing.sponsors[0].instagram_url,'https://www.instagram.com/marca/');
+const newLogo=await (await upload('small.png','image/png')).json();
+assert.equal((await crud.PATCH(req('PATCH',{...body,id,name:'Editado',description:'Nova descrição',instagram_url:'@nova',logo_url:newLogo.url}))).status,200);
+listing=await (await publicApi.GET()).json();assert.equal(listing.sponsors[0].description,'Nova descrição');assert.equal(listing.sponsors[0].logo_url,newLogo.url);
+assert.equal((await crud.DELETE(req('DELETE',{id}))).status,200);assert.equal((await (await publicApi.GET()).json()).sponsors.length,0);
+await assert.rejects(()=>validation.sponsorResponse(new Response('Payload Too Large',{status:413}),'Erro'),{message:validation.SPONSOR_SIZE_ERROR});
+await assert.rejects(()=>validation.sponsorResponse(new Response('<html>error</html>',{status:502}),'Falha no envio.'),{message:'Falha no envio.'});
+await assert.rejects(()=>validation.sponsorResponse(new Response('not json',{headers:{'content-type':'application/json'}}),'Falha no envio.'),{message:'Falha no envio.'});
+assert.equal(await (await worker.fetch(new Request('https://league.test/api/teams'),{},{})).text(),'untouched route');
+console.log('PASS exact 5 MB boundary, oversized files, authentication, MIME/extension/signature, description validation, create/edit/replace/delete, public database list, non-JSON errors and scoped routing.');
+sqlite.close();

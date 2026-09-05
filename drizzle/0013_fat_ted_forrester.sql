@@ -1,0 +1,1 @@
+ALTER TABLE `competition_stages` ADD `group_count` integer;
